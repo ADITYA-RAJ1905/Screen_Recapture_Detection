@@ -390,16 +390,34 @@ def extract_features(img_bgr):
 # PREDICTION (works on an in-memory BGR array)
 # -------------------------------
 
-def predict_frame(img_bgr):
+def predict_upload(img_bgr):
 
     image = Image.fromarray(
         cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     )
+
     x = val_transform(image).unsqueeze(0).to(device)
 
     with torch.no_grad():
         output = eff_model(x)
+        eff_score = torch.softmax(output, dim=1)[0][1].item()
 
+    feats = extract_features(img_bgr).reshape(1, -1)
+    xgb_score = xgb_model.predict_proba(feats)[0][1]
+
+    final_score = 0.6 * eff_score + 0.4 * xgb_score
+
+    return final_score, eff_score, xgb_score
+def predict_live(img_bgr):
+
+    image = Image.fromarray(
+        cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    )
+
+    x = val_transform(image).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = eff_model(x)
         eff_score = torch.softmax(output, dim=1)[0][1].item()
 
     return eff_score, eff_score, 0.0
@@ -469,7 +487,7 @@ if WEBRTC_AVAILABLE:
             # Only run the (heavier) models every N frames to keep video smooth
             if self.frame_count % max(self.analyze_every_n, 1) == 0:
                 try:
-                    score, eff_score, xgb_score = predict_frame(img)
+                    score, eff_score, xgb_score = predict_live(img)
                     with self.lock:
                         self.score = score
                         self.eff_score = eff_score
@@ -538,7 +556,7 @@ with upload_tab:
         img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
 
         with st.spinner("🔍 Analyzing pixels, frequencies & textures..."):
-            score, eff_score, xgb_score = predict_frame(img_bgr)
+            score, eff_score, xgb_score = predict_upload(img_bgr)
             time.sleep(0.3)
 
         st.markdown("### Result")
