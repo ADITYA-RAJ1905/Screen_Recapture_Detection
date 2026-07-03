@@ -7,3 +7,5 @@ Pillow
 joblib
 xgboost
 scikit-image
+streamlit-webrtc
+av
