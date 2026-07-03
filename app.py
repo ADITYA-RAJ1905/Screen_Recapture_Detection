@@ -392,28 +392,17 @@ def extract_features(img_bgr):
 
 def predict_frame(img_bgr):
 
-    # EfficientNet
-    image = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-
+    image = Image.fromarray(
+        cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    )
     x = val_transform(image).unsqueeze(0).to(device)
 
     with torch.no_grad():
         output = eff_model(x)
 
-        eff_score = torch.softmax(
-            output,
-            dim=1
-        )[0][1].item()
+        eff_score = torch.softmax(output, dim=1)[0][1].item()
 
-    # XGBoost
-    feats = extract_features(img_bgr).reshape(1, -1)
-
-    xgb_score = xgb_model.predict_proba(feats)[0][1]
-
-    # Ensemble
-    final_score = 0.6 * eff_score + 0.4 * xgb_score
-
-    return final_score, eff_score, xgb_score
+    return eff_score, eff_score, 0.0
 
 
 def render_result_html(score):
