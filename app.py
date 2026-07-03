@@ -7,7 +7,6 @@ import cv2
 import numpy as np
 import joblib
 from skimage.feature import local_binary_pattern
-import os
 import time
 
 # -------------------------------
@@ -174,6 +173,26 @@ st.markdown("""
         border-right: 1px solid rgba(255,255,255,0.08);
     }
 
+    /* Live badge */
+    .live-badge {
+        display: inline-block;
+        background: #ff5454;
+        color: white;
+        font-size: 0.75rem;
+        font-weight: 700;
+        letter-spacing: 1px;
+        padding: 0.15rem 0.6rem;
+        border-radius: 999px;
+        margin-left: 0.5rem;
+        animation: pulse 1.4s infinite;
+        vertical-align: middle;
+    }
+    @keyframes pulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.4; }
+        100% { opacity: 1; }
+    }
+
     .footer-note {
         text-align: center;
         color: #6c6c8a;
@@ -219,6 +238,20 @@ with st.sidebar:
         - **0.00 – 0.49** → ✅ Real Photo  
         - **0.50 – 1.00** → ⚠️ Screen Recapture
         """
+    )
+    st.markdown("---")
+    st.markdown("### 🎥 Live Camera Settings")
+    camera_index = st.number_input(
+        "Camera index", min_value=0, max_value=10, value=0, step=1,
+        help="Change this if you have multiple cameras (e.g. 1 for an external webcam)."
+    )
+    analyze_every_n = st.slider(
+        "Analyze every N frames", min_value=1, max_value=15, value=5,
+        help="Higher = smoother video but less frequent score updates."
+    )
+    st.caption(
+        "Note: Live Camera uses the webcam attached to the machine running this "
+        "Streamlit app (via OpenCV), not the visitor's browser camera."
     )
     st.markdown("---")
     st.caption("Built with PyTorch, XGBoost & Streamlit")
@@ -279,14 +312,12 @@ val_transform = transforms.Compose([
 ])
 
 # -------------------------------
-# FEATURE EXTRACTION
+# FEATURE EXTRACTION (works on an in-memory BGR array)
 # -------------------------------
 
-def extract_features(image_path):
+def extract_features(img_bgr):
 
-    img = cv2.imread(image_path)
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
     features = []
 
@@ -343,13 +374,13 @@ def extract_features(image_path):
     return np.array(features)
 
 # -------------------------------
-# PREDICTION
+# PREDICTION (works on an in-memory BGR array)
 # -------------------------------
 
-def predict(image_path):
+def predict_frame(img_bgr):
 
     # EfficientNet
-    image = Image.open(image_path).convert("RGB")
+    image = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
     x = val_transform(image).unsqueeze(0).to(device)
 
@@ -362,7 +393,7 @@ def predict(image_path):
         )[0][1].item()
 
     # XGBoost
-    feats = extract_features(image_path).reshape(1, -1)
+    feats = extract_features(img_bgr).reshape(1, -1)
 
     xgb_score = xgb_model.predict_proba(feats)[0][1]
 
@@ -371,99 +402,205 @@ def predict(image_path):
 
     return final_score, eff_score, xgb_score
 
+
+def render_result_html(score):
+    if score >= 0.5:
+        return f"""
+        <div class="result-screen">
+            <div class="result-emoji">⚠️</div>
+            <div class="result-label" style="color:#ff5454;">SCREEN PHOTO DETECTED</div>
+            <div class="result-confidence">Confidence: {score:.2%}</div>
+        </div>
+        """
+    else:
+        return f"""
+        <div class="result-real">
+            <div class="result-emoji">✅</div>
+            <div class="result-label" style="color:#2cb67d;">AUTHENTIC REAL PHOTO</div>
+            <div class="result-confidence">Confidence: {1 - score:.2%}</div>
+        </div>
+        """
+
+
+def render_metrics_html(score, eff_score, xgb_score):
+    return f"""
+    <div style="display:flex; gap:0.8rem; margin-top:0.8rem;">
+        <div class="metric-pill" style="flex:1;">
+            <div class="value">{score:.2f}</div>
+            <div class="label">Final Score</div>
+        </div>
+        <div class="metric-pill" style="flex:1;">
+            <div class="value">{eff_score:.2f}</div>
+            <div class="label">EfficientNet</div>
+        </div>
+        <div class="metric-pill" style="flex:1;">
+            <div class="value">{xgb_score:.2f}</div>
+            <div class="label">XGBoost</div>
+        </div>
+    </div>
+    """
+
 # -------------------------------
-# UI — UPLOAD CARD
+# UI — TABS
 # -------------------------------
 
-st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-uploaded_file = st.file_uploader(
-    "Choose an image",
-    type=["jpg", "jpeg", "png"],
-    label_visibility="collapsed"
-)
-if uploaded_file is None:
+upload_tab, camera_tab = st.tabs(["📤 Upload Image", "🎥 Live Camera"])
+
+# =========================================================
+# TAB 1 — UPLOAD IMAGE
+# =========================================================
+with upload_tab:
+
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    uploaded_file = st.file_uploader(
+        "Choose an image",
+        type=["jpg", "jpeg", "png"],
+        label_visibility="collapsed"
+    )
+    if uploaded_file is None:
+        st.markdown(
+            "<div style='text-align:center; color:#b8b8d1;'>"
+            "📤 Drag & drop or click to upload a JPG / PNG image"
+            "</div>",
+            unsafe_allow_html=True
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if uploaded_file is not None:
+
+        image = Image.open(uploaded_file).convert("RGB")
+
+        st.image(
+            image,
+            caption="Uploaded Image",
+            use_container_width=True
+        )
+
+        img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+        with st.spinner("🔍 Analyzing pixels, frequencies & textures..."):
+            score, eff_score, xgb_score = predict_frame(img_bgr)
+            time.sleep(0.3)
+
+        st.markdown("### Result")
+        st.markdown(render_result_html(score), unsafe_allow_html=True)
+
+        st.write("")
+        st.progress(float(score))
+        st.write(f"Screen Probability: **{score:.4f}**")
+
+        st.write("")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(
+                f"""<div class="metric-pill">
+                        <div class="value">{score:.2f}</div>
+                        <div class="label">Final Score</div>
+                    </div>""",
+                unsafe_allow_html=True
+            )
+        with c2:
+            st.markdown(
+                f"""<div class="metric-pill">
+                        <div class="value">{eff_score:.2f}</div>
+                        <div class="label">EfficientNet</div>
+                    </div>""",
+                unsafe_allow_html=True
+            )
+        with c3:
+            st.markdown(
+                f"""<div class="metric-pill">
+                        <div class="value">{xgb_score:.2f}</div>
+                        <div class="label">XGBoost</div>
+                    </div>""",
+                unsafe_allow_html=True
+            )
+
+# =========================================================
+# TAB 2 — LIVE CAMERA
+# =========================================================
+with camera_tab:
+
     st.markdown(
-        "<div style='text-align:center; color:#b8b8d1;'>"
-        "📤 Drag & drop or click to upload a JPG / PNG image"
-        "</div>",
+        '<div class="glass-card">'
+        '<b>Live Detection</b><span class="live-badge">● LIVE</span>'
+        '<div style="color:#b8b8d1; margin-top:0.5rem; font-size:0.92rem;">'
+        'Starts your webcam and classifies the feed in real time. '
+        'Uses the camera on the machine running this app.'
+        '</div></div>',
         unsafe_allow_html=True
     )
-st.markdown('</div>', unsafe_allow_html=True)
 
-if uploaded_file is not None:
+    run = st.checkbox("▶️ Start Camera", key="run_camera")
 
-    image = Image.open(uploaded_file)
+    frame_placeholder = st.empty()
+    result_placeholder = st.empty()
+    metrics_placeholder = st.empty()
+    fps_placeholder = st.empty()
 
-    st.image(
-        image,
-        caption="Uploaded Image",
-        use_container_width=True
-    )
+    if run:
+        cap = cv2.VideoCapture(int(camera_index))
 
-    with open("temp.jpg", "wb") as f:
-        f.write(uploaded_file.getbuffer())
+        if not cap.isOpened():
+            st.error(
+                f"❌ Could not open camera index {camera_index}. "
+                "Try a different index in the sidebar, or check camera permissions."
+            )
+        else:
+            frame_count = 0
+            score, eff_score, xgb_score = 0.0, 0.0, 0.0
+            prev_time = time.time()
 
-    with st.spinner("🔍 Analyzing pixels, frequencies & textures..."):
-        score, eff_score, xgb_score = predict("temp.jpg")
-        time.sleep(0.3)
+            while st.session_state.get("run_camera", False):
 
-    os.remove("temp.jpg")
+                ok, frame = cap.read()
+                if not ok:
+                    st.warning("⚠️ Failed to read from camera.")
+                    break
 
-    st.markdown("### Result")
+                frame_count += 1
 
-    if score >= 0.5:
-        st.markdown(
-            f"""
-            <div class="result-screen">
-                <div class="result-emoji">⚠️</div>
-                <div class="result-label" style="color:#ff5454;">SCREEN PHOTO DETECTED</div>
-                <div class="result-confidence">Confidence: {score:.2%}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+                # Run the (heavier) model every N frames to keep video smooth
+                if frame_count % analyze_every_n == 0:
+                    try:
+                        score, eff_score, xgb_score = predict_frame(frame)
+                    except Exception as e:
+                        st.warning(f"Prediction error: {e}")
+
+                # Overlay the latest score on the frame
+                label = "SCREEN" if score >= 0.5 else "REAL"
+                color = (84, 84, 255) if score >= 0.5 else (125, 182, 44)  # BGR
+                overlay = frame.copy()
+                cv2.rectangle(overlay, (0, 0), (overlay.shape[1], 50), (20, 20, 20), -1)
+                frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+                cv2.putText(
+                    frame,
+                    f"{label}  |  score: {score:.2f}",
+                    (15, 33),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    color,
+                    2,
+                    cv2.LINE_AA
+                )
+
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
+
+                result_placeholder.markdown(render_result_html(score), unsafe_allow_html=True)
+                metrics_placeholder.markdown(
+                    render_metrics_html(score, eff_score, xgb_score), unsafe_allow_html=True
+                )
+
+                now = time.time()
+                fps = 1.0 / max(now - prev_time, 1e-6)
+                prev_time = now
+                fps_placeholder.caption(f"~{fps:.1f} FPS · analyzing every {analyze_every_n} frame(s)")
+
+            cap.release()
+            frame_placeholder.empty()
     else:
-        st.markdown(
-            f"""
-            <div class="result-real">
-                <div class="result-emoji">✅</div>
-                <div class="result-label" style="color:#2cb67d;">AUTHENTIC REAL PHOTO</div>
-                <div class="result-confidence">Confidence: {1 - score:.2%}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    st.write("")
-    st.progress(float(score))
-    st.write(f"Screen Probability: **{score:.4f}**")
-
-    st.write("")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown(
-            f"""<div class="metric-pill">
-                    <div class="value">{score:.2f}</div>
-                    <div class="label">Final Score</div>
-                </div>""",
-            unsafe_allow_html=True
-        )
-    with c2:
-        st.markdown(
-            f"""<div class="metric-pill">
-                    <div class="value">{eff_score:.2f}</div>
-                    <div class="label">EfficientNet</div>
-                </div>""",
-            unsafe_allow_html=True
-        )
-    with c3:
-        st.markdown(
-            f"""<div class="metric-pill">
-                    <div class="value">{xgb_score:.2f}</div>
-                    <div class="label">XGBoost</div>
-                </div>""",
-            unsafe_allow_html=True
-        )
+        st.info("Toggle **Start Camera** above to begin live analysis.")
 
 st.markdown(
     '<div class="footer-note">Made with 💜 using PyTorch · XGBoost · Streamlit</div>',
