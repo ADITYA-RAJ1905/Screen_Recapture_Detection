@@ -8,6 +8,16 @@ import numpy as np
 import joblib
 from skimage.feature import local_binary_pattern
 import time
+import threading
+
+# streamlit-webrtc gives us access to the VISITOR'S browser camera (works on
+# desktop and mobile) instead of the camera attached to the server.
+try:
+    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+    import av
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
 
 # -------------------------------
 # PAGE CONFIG
@@ -241,17 +251,20 @@ with st.sidebar:
     )
     st.markdown("---")
     st.markdown("### 🎥 Live Camera Settings")
-    camera_index = st.number_input(
-        "Camera index", min_value=0, max_value=10, value=0, step=1,
-        help="Change this if you have multiple cameras (e.g. 1 for an external webcam)."
+    facing_mode = st.radio(
+        "Camera",
+        options=["environment", "user"],
+        format_func=lambda x: "📷 Back camera" if x == "environment" else "🤳 Front camera",
+        horizontal=True,
+        help="On phones, 'Back camera' usually gives sharper results for document/photo checks."
     )
     analyze_every_n = st.slider(
         "Analyze every N frames", min_value=1, max_value=15, value=5,
         help="Higher = smoother video but less frequent score updates."
     )
     st.caption(
-        "Note: Live Camera uses the webcam attached to the machine running this "
-        "Streamlit app (via OpenCV), not the visitor's browser camera."
+        "Live Camera streams video straight from **your device's browser** "
+        "(works on phones/tablets too) using WebRTC — nothing is accessed on the server."
     )
     st.markdown("---")
     st.caption("Built with PyTorch, XGBoost & Streamlit")
@@ -441,6 +454,63 @@ def render_metrics_html(score, eff_score, xgb_score):
     """
 
 # -------------------------------
+# WEBRTC VIDEO PROCESSOR (runs in its own thread per browser connection)
+# -------------------------------
+
+if WEBRTC_AVAILABLE:
+
+    RTC_CONFIGURATION = RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
+
+    class ScreenRecaptureProcessor(VideoProcessorBase):
+        def __init__(self):
+            self.frame_count = 0
+            self.analyze_every_n = 5
+            self.lock = threading.Lock()
+            self.score = 0.0
+            self.eff_score = 0.0
+            self.xgb_score = 0.0
+
+        def recv(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+
+            self.frame_count += 1
+
+            # Only run the (heavier) models every N frames to keep video smooth
+            if self.frame_count % max(self.analyze_every_n, 1) == 0:
+                try:
+                    score, eff_score, xgb_score = predict_frame(img)
+                    with self.lock:
+                        self.score = score
+                        self.eff_score = eff_score
+                        self.xgb_score = xgb_score
+                except Exception:
+                    pass
+
+            with self.lock:
+                score = self.score
+
+            # Overlay the latest score directly on the video
+            label = "SCREEN" if score >= 0.5 else "REAL"
+            color = (84, 84, 255) if score >= 0.5 else (125, 182, 44)  # BGR
+            overlay = img.copy()
+            cv2.rectangle(overlay, (0, 0), (overlay.shape[1], 50), (20, 20, 20), -1)
+            img = cv2.addWeighted(overlay, 0.6, img, 0.4, 0)
+            cv2.putText(
+                img,
+                f"{label}  |  score: {score:.2f}",
+                (15, 33),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                color,
+                2,
+                cv2.LINE_AA
+            )
+
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+# -------------------------------
 # UI — TABS
 # -------------------------------
 
@@ -517,7 +587,7 @@ with upload_tab:
             )
 
 # =========================================================
-# TAB 2 — LIVE CAMERA
+# TAB 2 — LIVE CAMERA (browser / mobile camera via WebRTC)
 # =========================================================
 with camera_tab:
 
@@ -525,82 +595,60 @@ with camera_tab:
         '<div class="glass-card">'
         '<b>Live Detection</b><span class="live-badge">● LIVE</span>'
         '<div style="color:#b8b8d1; margin-top:0.5rem; font-size:0.92rem;">'
-        'Starts your webcam and classifies the feed in real time. '
-        'Uses the camera on the machine running this app.'
+        'Streams your camera straight from the browser — works on phones and tablets. '
+        'Tap "Start", then allow camera access when prompted.'
         '</div></div>',
         unsafe_allow_html=True
     )
 
-    run = st.checkbox("▶️ Start Camera", key="run_camera")
-
-    frame_placeholder = st.empty()
-    result_placeholder = st.empty()
-    metrics_placeholder = st.empty()
-    fps_placeholder = st.empty()
-
-    if run:
-        cap = cv2.VideoCapture(int(camera_index))
-
-        if not cap.isOpened():
-            st.error(
-                f"❌ Could not open camera index {camera_index}. "
-                "Try a different index in the sidebar, or check camera permissions."
-            )
-        else:
-            frame_count = 0
-            score, eff_score, xgb_score = 0.0, 0.0, 0.0
-            prev_time = time.time()
-
-            while st.session_state.get("run_camera", False):
-
-                ok, frame = cap.read()
-                if not ok:
-                    st.warning("⚠️ Failed to read from camera.")
-                    break
-
-                frame_count += 1
-
-                # Run the (heavier) model every N frames to keep video smooth
-                if frame_count % analyze_every_n == 0:
-                    try:
-                        score, eff_score, xgb_score = predict_frame(frame)
-                    except Exception as e:
-                        st.warning(f"Prediction error: {e}")
-
-                # Overlay the latest score on the frame
-                label = "SCREEN" if score >= 0.5 else "REAL"
-                color = (84, 84, 255) if score >= 0.5 else (125, 182, 44)  # BGR
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (0, 0), (overlay.shape[1], 50), (20, 20, 20), -1)
-                frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
-                cv2.putText(
-                    frame,
-                    f"{label}  |  score: {score:.2f}",
-                    (15, 33),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    color,
-                    2,
-                    cv2.LINE_AA
-                )
-
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-
-                result_placeholder.markdown(render_result_html(score), unsafe_allow_html=True)
-                metrics_placeholder.markdown(
-                    render_metrics_html(score, eff_score, xgb_score), unsafe_allow_html=True
-                )
-
-                now = time.time()
-                fps = 1.0 / max(now - prev_time, 1e-6)
-                prev_time = now
-                fps_placeholder.caption(f"~{fps:.1f} FPS · analyzing every {analyze_every_n} frame(s)")
-
-            cap.release()
-            frame_placeholder.empty()
+    if not WEBRTC_AVAILABLE:
+        st.error(
+            "Live camera requires the `streamlit-webrtc` package, which isn't installed.\n\n"
+            "Install it with:\n\n"
+            "```\npip install streamlit-webrtc av\n```\n\n"
+            "then restart the app."
+        )
     else:
-        st.info("Toggle **Start Camera** above to begin live analysis.")
+        st.caption(
+            "📶 Note: browsers only allow camera access over **HTTPS** (or `localhost`). "
+            "If you're testing over a plain `http://` LAN address on your phone, the camera "
+            "prompt won't appear — deploy behind HTTPS or use `localhost`/ngrok/Streamlit "
+            "Cloud instead."
+        )
+
+        ctx = webrtc_streamer(
+            key="screen-recapture-live",
+            video_processor_factory=ScreenRecaptureProcessor,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={
+                "video": {"facingMode": {"ideal": facing_mode}},
+                "audio": False,
+            },
+            async_processing=True,
+        )
+
+        result_placeholder = st.empty()
+        metrics_placeholder = st.empty()
+
+        if ctx.video_processor:
+            ctx.video_processor.analyze_every_n = analyze_every_n
+
+        if ctx.state.playing:
+            # Poll the processor's latest score and refresh the UI below the video
+            while ctx.state.playing:
+                if ctx.video_processor:
+                    with ctx.video_processor.lock:
+                        score = ctx.video_processor.score
+                        eff_score = ctx.video_processor.eff_score
+                        xgb_score = ctx.video_processor.xgb_score
+
+                    result_placeholder.markdown(render_result_html(score), unsafe_allow_html=True)
+                    metrics_placeholder.markdown(
+                        render_metrics_html(score, eff_score, xgb_score), unsafe_allow_html=True
+                    )
+                time.sleep(0.4)
+        else:
+            st.info("Tap **Start** above to begin live analysis.")
 
 st.markdown(
     '<div class="footer-note">Made with 💜 using PyTorch · XGBoost · Streamlit</div>',
