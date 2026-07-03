@@ -41,7 +41,7 @@ st.markdown("""
     /* Hide default Streamlit chrome */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
+    /* header {visibility: hidden;} */
 
     /* Hero header */
     .hero-title {
